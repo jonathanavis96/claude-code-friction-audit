@@ -1,0 +1,4 @@
+{"type": "permission-mode", "permissionMode": "bypassPermissions", "sessionId": "s"}
+{"type": "assistant", "message": {"id": "pm_msg_1", "model": "claude-sonnet-5", "usage": {"input_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}, "content": [{"type": "tool_use", "id": "toolu_pm1", "name": "Bash", "input": {"command": "echo hi"}}]}, "timestamp": "2026-01-02T00:00:00Z"}
+{"type": "user", "message": {"role": "user", "content": "do the next thing"}, "entrypoint": "cli", "origin": {"kind": "human"}, "promptSource": "typed", "permissionMode": "default"}
+{"type": "assistant", "message": {"id": "pm_msg_2", "model": "claude-sonnet-5", "usage": {"input_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}, "content": [{"type": "tool_use", "id": "toolu_pm2", "name": "Bash", "input": {"command": "echo bye"}}]}, "timestamp": "2026-01-02T00:00:01Z"}

@@ -1,0 +1,10 @@
+{"type": "user", "message": {"content": "fix the bug"}, "entrypoint": "cli", "origin": {"kind": "human"}, "promptSource": "typed"}
+{"type": "user", "message": {"content": "another task"}, "promptSource": "typed"}
+{"type": "user", "message": {"content": "queued task"}, "promptSource": "queued"}
+{"type": "user", "message": {"content": "queued again"}, "entrypoint": "cli", "origin": {"kind": "human"}, "promptSource": "queued"}
+{"type": "user", "message": {"content": "notification text"}, "entrypoint": "cli", "origin": {"kind": "task-notification"}, "promptSource": "system"}
+{"type": "user", "message": {"content": "sdk prompt"}, "entrypoint": "sdk-py", "promptSource": "sdk"}
+{"type": "user", "message": {"content": "meta record"}, "entrypoint": "cli", "isMeta": true}
+{"type": "user", "message": {"content": "<command-name>/clear</command-name>"}}
+{"type": "user", "message": {"content": "<local-command-stdout>ok</local-command-stdout>"}}
+{"type": "user", "toolUseResult": {"ok": true}, "message": {"content": "result text"}}

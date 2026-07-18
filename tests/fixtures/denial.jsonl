@@ -1,0 +1,4 @@
+{"type": "permission-mode", "permissionMode": "bypassPermissions", "sessionId": "s"}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "The user doesn't want to proceed with this tool use."}]}}
+{"type": "permission-mode", "permissionMode": "default", "sessionId": "s"}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2", "is_error": true, "content": "The user doesn't want to proceed with this tool use."}]}}
