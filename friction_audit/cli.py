@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -21,6 +22,34 @@ def _latest_previous(out_dir: Path, exclude: Path | None) -> Path | None:
 def _load(path: Path) -> dict:
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def _try_load(path: Path) -> dict | None:
+    """Load a snapshot, or None (with a warning) if it is unreadable or corrupt."""
+    try:
+        data = _load(path)
+    except (OSError, ValueError) as exc:
+        print(f"warning: cannot read snapshot {path}: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        print(f"warning: snapshot {path} is not a JSON object", file=sys.stderr)
+        return None
+    return data
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write via a temp file and rename, so an interrupted cron run never
+    leaves a truncated snapshot for the next run to pick up as 'previous'."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,7 +76,11 @@ def main(argv: list[str] | None = None) -> int:
             if not p.is_file():
                 print(f"error: no such snapshot: {p}", file=sys.stderr)
                 return 2
-        diff = compare_mod.compare(_load(old_p), _load(new_p))
+        old, new = _try_load(old_p), _try_load(new_p)
+        if old is None or new is None:
+            print("error: cannot compare a corrupt snapshot", file=sys.stderr)
+            return 2
+        diff = compare_mod.compare(old, new)
         print(json.dumps(diff, indent=2))
         _print_diff_table(diff)
         return 0
@@ -65,12 +98,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     snap_path = out_dir / snapshot.default_filename(snap)
-    snap_path.write_text(json.dumps(snap, indent=1), encoding="utf-8")
+    _write_atomic(snap_path, json.dumps(snap, indent=1))
     if not args.quiet:
         print(f"snapshot -> {snap_path}", file=sys.stderr)
 
     prev_path = Path(args.previous) if args.previous else _latest_previous(out_dir, snap_path)
-    prev = _load(prev_path) if prev_path and prev_path.is_file() else None
+    prev = _try_load(prev_path) if prev_path and prev_path.is_file() else None
     diff = compare_mod.compare(prev, snap) if prev else None
 
     if not args.no_report:
@@ -78,9 +111,9 @@ def main(argv: list[str] | None = None) -> int:
         # which is the expensive artefact.
         from . import report
 
-        html = report.render(snap, prev, diff, prev_path=str(prev_path) if prev_path else None)
+        html = report.render(snap, prev, diff, prev_path=str(prev_path) if prev else None)
         rep_path = out_dir / f"report-{snapshot.default_filename(snap)[9:-5]}.html"
-        rep_path.write_text(html, encoding="utf-8")
+        _write_atomic(rep_path, html)
         if not args.quiet:
             print(f"report   -> {rep_path}", file=sys.stderr)
 

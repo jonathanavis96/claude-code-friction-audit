@@ -7,6 +7,7 @@ counts) because a finding without evidence does not ship.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import re
 from collections import Counter, defaultdict
@@ -985,12 +986,34 @@ def _window_delta(prefix: dict, postfix: dict) -> list[dict]:
     return rows
 
 
+def _local_day(ts: str | None, tz: _dt.tzinfo | None = None) -> str:
+    """Calendar day of *ts* in *tz* (None = this machine's local zone).
+
+    Transcript timestamps are UTC (``...Z``) but ``FIXES_APPLIED_AT`` and the
+    report's days are local dates. Slicing ``ts[:10]`` put every session
+    started between local midnight and the UTC offset on the previous day --
+    e.g. a 01:30 SAST session on the fix day landed in the pre-fix window.
+    A naive or unparseable timestamp falls back to its literal date.
+    """
+    if not ts:
+        return ""
+    raw = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        parsed = _dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return ts[:10]
+    if parsed.tzinfo is None:
+        return parsed.date().isoformat()
+    return parsed.astimezone(tz).date().isoformat()
+
+
 def daily_behaviour(
     sessions: dict,
     fixes_applied_at: str,
     rolling_days: int = 7,
     keep_days: int = 21,
     exclude_self: bool = True,
+    tz: _dt.tzinfo | None = None,
 ) -> dict:
     """Per-day and pre/post-fix behavioural view, self-instrumentation removed.
 
@@ -1008,7 +1031,7 @@ def daily_behaviour(
     by_day_sessions: dict[str, list] = defaultdict(list)
     undated = 0
     for s in kept:
-        day = (s["first_ts"] or "")[:10]
+        day = _local_day(s["first_ts"], tz)
         if day:
             by_day_sessions[day].append(s)
         else:
