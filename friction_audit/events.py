@@ -21,6 +21,7 @@ things that silently fabricate numbers if you get them wrong:
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -126,11 +127,32 @@ def usage_from_message(message: dict) -> Usage | None:
     if not isinstance(u, dict):
         return None
     return Usage(
-        cache_read=int(u.get("cache_read_input_tokens") or 0),
-        cache_create=int(u.get("cache_creation_input_tokens") or 0),
-        fresh=int(u.get("input_tokens") or 0),
-        output=int(u.get("output_tokens") or 0),
+        cache_read=_tokens(u.get("cache_read_input_tokens")),
+        cache_create=_tokens(u.get("cache_creation_input_tokens")),
+        fresh=_tokens(u.get("input_tokens")),
+        output=_tokens(u.get("output_tokens")),
     )
+
+
+def _tokens(value) -> int:
+    """A token count, or 0 for anything that is not a number.
+
+    int("n/a") or int({...}) used to raise, and one bad usage field then
+    discarded the whole transcript at the sweep level.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # json.loads accepts NaN/Infinity, and int() of those raises.
+        return int(value) if math.isfinite(value) else 0
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -169,6 +191,8 @@ _AUTOMATION_CONTENT = (
 
 def message_text(message: dict) -> str:
     """Flatten a message's content to plain text."""
+    if not isinstance(message, dict):
+        return ""
     content = message.get("content")
     if isinstance(content, str):
         return content
@@ -319,6 +343,12 @@ def parse_transcript(path: Path, seen_message_ids: set[str]) -> ParsedTranscript
 
     for event, ok in iter_events(path):
         if not ok or event is None:
+            out.bad_lines += 1
+            continue
+        # A truncated or foreign record can carry a non-object "message".
+        # Every handler below calls .get() on it, and one AttributeError
+        # discards the whole transcript (and its tokens) at the sweep level.
+        if "message" in event and not isinstance(event["message"], (dict, type(None))):
             out.bad_lines += 1
             continue
 
