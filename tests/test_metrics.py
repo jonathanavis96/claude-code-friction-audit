@@ -89,6 +89,83 @@ class ClassifyBypassTests(unittest.TestCase):
             "was-never-blocked-anyway",
         )
 
+    def test_words_that_only_look_like_a_recursive_flag(self):
+        for cmd in (
+            "grep foo some-report.py",
+            "grep --color foo app.py",
+            "grep --line-number foo app.py",
+            "grep -n foo app.py && rm -rf build",
+            "sort -r names.py | grep foo",
+            "grep 'a -r b' app.py",
+            "grep foo /opt/rg/app.py",
+            "grep -er foo app.py",
+            "grep -e -r app.py",
+            "grep -A3 -m1 foo app.py",
+            "grep -- -r app.py",
+            "grep foo app.py  # [graphify-ok: literal] don't need the graph",
+            "find src -iregex '.*py'",
+            "find src -name '*.py' -print0",
+            "xargs -r grep foo < list",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(
+                    metrics._classify_bypass(cmd, set()), "was-never-blocked-anyway"
+                )
+
+    def test_real_tree_searches(self):
+        for cmd in (
+            "grep -R foo src",
+            "grep -rn foo src",
+            "grep -nr foo src",
+            "grep -nA3 -ri foo src",
+            "grep foo src -r",
+            "grep --recursive foo src",
+            "grep --dereference-recursive foo src",
+            "grep --directories=recurse foo src",
+            "grep -d recurse foo src",
+            "grep --directories recurse foo src",
+            "grep -drecurse foo src",
+            "egrep -r foo src",
+            "/usr/bin/grep -r foo src",
+            "cd src && grep -r foo .",
+            "cat list | xargs grep -r foo",
+            "X=$(grep -r foo src)",
+            'echo "$(grep -r foo src)"',
+            "echo `grep -r foo src`",
+            "bash -c 'grep -r foo src'",
+            "grep -r foo src  # it's a literal",
+            "git grep foo",
+            "git -C repo grep foo",
+            "rg foo",
+            "ripgrep foo",
+            "ag foo",
+            "ack foo",
+            "find src -exec grep foo {} +",
+            "find src -name '*.py' | xargs grep foo",
+            "grep foo $(find src -name '*.py')",
+            "git ls-files | xargs grep foo",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(
+                    metrics._classify_bypass(cmd, set()), "genuine-circumvention"
+                )
+
+    def test_a_tool_name_inside_another_word_is_not_a_search(self):
+        for cmd in ("cat grep-notes.md", "python3 find_it.py", "ls /opt/rg/"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(
+                    metrics._classify_bypass(cmd, set()), "no-search-command-at-all"
+                )
+
+    def test_a_command_with_unbalanced_quotes_is_still_classified(self):
+        self.assertEqual(
+            metrics._classify_bypass("grep -r it's src", set()), "genuine-circumvention"
+        )
+        self.assertEqual(
+            metrics._classify_bypass("grep it's some-report.py", set()),
+            "was-never-blocked-anyway",
+        )
+
 
 def _main_session(human_messages, skills_fired=()):
     return {
@@ -127,6 +204,96 @@ class EvidenceSnippetTests(unittest.TestCase):
         gap = next(g for g in out["gaps"] if g["skill"] == "ship-to-main")
         self.assertEqual(gap["ask_sessions"], 1)
         self.assertIn("ship it", gap["examples"][0]["text"].lower())
+
+
+def _padding(sid: str) -> str:
+    """Filler unique to one session, so only the phrase under test recurs."""
+    return " ".join(f"pad{sid}{i}" for i in range(80))
+
+
+class RepeatedPhraseTests(unittest.TestCase):
+    def _phrases(self, messages_by_session):
+        sessions = {
+            sid: _main_session(messages) for sid, messages in messages_by_session.items()
+        }
+        # The filler sessions keep the phrase under the 40% background cutoff.
+        for i in range(12):
+            sessions[f"filler{i}"] = _main_session([f"unrelated{i} topic{i}"])
+        with tempfile.TemporaryDirectory() as d:
+            return metrics.repeated_context(sessions, Path(d))
+
+    def test_trailing_punctuation_does_not_split_a_phrase(self):
+        rc = self._phrases({
+            "a": ["please restart nginx"],
+            "b": ["then restart nginx."],
+            "c": ["can you restart nginx, then stop"],
+            "d": ["restart nginx-"],
+        })
+        terms = [t for r in rc["repeated_phrases"] for t in r["terms"]]
+        self.assertIn("restart nginx", terms)
+        self.assertNotIn("restart nginx.", terms)
+        self.assertNotIn("restart nginx-", terms)
+        row = next(r for r in rc["repeated_phrases"] if "restart nginx" in r["terms"])
+        self.assertEqual(row["sessions"], 4)
+
+    def test_a_stop_word_with_punctuation_is_still_a_stop_word(self):
+        self.assertEqual(metrics._normalise("restart the. nginx"), ["restart", "nginx"])
+
+    def test_inner_punctuation_is_kept(self):
+        self.assertEqual(
+            metrics._normalise("open mission.txt and foo-bar_baz."),
+            ["open", "mission.txt", "foo-bar_baz"],
+        )
+
+    def test_evidence_shows_the_phrase_when_stop_words_split_it(self):
+        rc = self._phrases({
+            sid: [f"{_padding(sid)} restart {middle} nginx {_padding(sid)}"]
+            for sid, middle in (("a", "the"), ("b", "all the"), ("c", "the"))
+        })
+        row = next(r for r in rc["repeated_phrases"] if "restart nginx" in r["terms"])
+        self.assertTrue(row["examples"])
+        for ex in row["examples"]:
+            self.assertIn("restart", ex["text"])
+            self.assertIn("nginx", ex["text"])
+
+    def test_evidence_keeps_the_original_case_and_layout(self):
+        rc = self._phrases({
+            sid: [f"{_padding(sid)} Restart\n\nNGINX {_padding(sid)}"] for sid in ("a", "b", "c")
+        })
+        row = next(r for r in rc["repeated_phrases"] if "restart nginx" in r["terms"])
+        for ex in row["examples"]:
+            self.assertIn("Restart NGINX", ex["text"])
+
+    def test_words_separated_by_a_long_code_block_still_give_evidence(self):
+        code = "```\n" + "x = 1\n" * 200 + "```"
+        rc = self._phrases({sid: [f"restart {code} nginx"] for sid in ("a", "b", "c")})
+        row = next(r for r in rc["repeated_phrases"] if "restart nginx" in r["terms"])
+        for ex in row["examples"]:
+            self.assertIn("restart", ex["text"])
+            self.assertLess(len(ex["text"]), 400)
+
+    def test_uncovered_count_leaves_out_templated_and_covered_phrases(self):
+        sessions = {
+            "a": ["restart nginx today"],
+            "b": ["restart nginx again", "morning digest 1"],
+            "c": ["restart nginx later", "morning digest 2"],
+            "d": ["morning digest 3"],
+            "e": ["rotate logs now"],
+            "f": ["rotate logs soon"],
+            "g": ["rotate logs later"],
+            "h": ["rotate logs again"],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "CLAUDE.md").write_text("Rule: rotate logs weekly.", encoding="utf-8")
+            sessions = {sid: _main_session(m) for sid, m in sessions.items()}
+            for i in range(12):
+                sessions[f"filler{i}"] = _main_session([f"unrelated{i} topic{i}"])
+            rc = metrics.repeated_context(sessions, Path(d))
+        status = {r["terms"][0]: r for r in rc["repeated_phrases"]}
+        self.assertTrue(status["morning digest"]["templated"])
+        self.assertTrue(status["rotate logs"]["covered_by_rule"])
+        self.assertFalse(status["restart nginx"]["covered_by_rule"])
+        self.assertEqual(rc["uncovered_repeats"], 1)
 
 
 class SelfInstrumentationTests(unittest.TestCase):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import re
+import shlex
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -402,11 +403,29 @@ _TRACKED_PROBES: dict[str, dict] = {
 }
 
 
+def _blank(match: re.Match) -> str:
+    return " " * len(match.group(0))
+
+
+def _salient_words(text: str) -> list[tuple[str, int, int]]:
+    """Each salient word of *text*, lower-cased, with its start and end offsets.
+
+    Code and URLs are blanked rather than removed so the offsets stay true to
+    the original message. Sentence punctuation is not part of a word, or
+    ``restart nginx.`` and ``restart nginx`` would count as different phrases.
+    """
+    text = re.sub(r"```.*?```", _blank, text, flags=re.S)
+    text = re.sub(r"https?://\S+", _blank, text)
+    words = []
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9_.-]{2,}", text):
+        word = m.group(0).rstrip("._-").lower()
+        if len(word) >= 3 and word not in _STOP:
+            words.append((word, m.start(), m.start() + len(word)))
+    return words
+
+
 def _normalise(text: str) -> list[str]:
-    text = re.sub(r"```.*?```", " ", text, flags=re.S)
-    text = re.sub(r"https?://\S+", " ", text)
-    words = re.findall(r"[a-z][a-z0-9_.-]{2,}", text.lower())
-    return [w for w in words if w not in _STOP]
+    return [word for word, _, _ in _salient_words(text)]
 
 
 def snippet(text: str, needle: str, width: int = 200) -> str:
@@ -422,6 +441,18 @@ def snippet(text: str, needle: str, width: int = 200) -> str:
     start = max(0, i - width // 3)
     end = min(len(flat), i + len(needle) + (2 * width) // 3)
     return ("..." if start else "") + flat[start:end] + ("..." if end < len(flat) else "")
+
+
+def _bigram_needle(msg: str, start: int, end: int) -> str:
+    """The text of a bigram as it was typed, stop words and all.
+
+    The bigram itself is built from filtered words, so it often appears nowhere
+    in the message and snippet() would fall back to a head-of-message excerpt.
+    Words with a code block or URL between them are too far apart to show
+    together, so the first word stands in.
+    """
+    needle = " ".join(msg[start:end].split())
+    return needle if len(needle) <= 120 else needle.split(" ", 1)[0]
 
 
 def _stitch(bigrams: list[str]) -> str:
@@ -532,8 +563,8 @@ def repeated_context(sessions: dict, claude_dir: Path, min_sessions: int = 3) ->
     for sid, s in sessions.items():
         seen_here = set()
         for msg in s["human_messages"]:
-            words = _normalise(msg)
-            for a, b in zip(words, words[1:]):
+            words = _salient_words(msg)
+            for (a, start, _), (b, _, end) in zip(words, words[1:]):
                 bg = f"{a} {b}"
                 if bg in seen_here:
                     continue
@@ -541,7 +572,7 @@ def repeated_context(sessions: dict, claude_dir: Path, min_sessions: int = 3) ->
                 bigram_sessions[bg].add(sid)
                 if len(bigram_examples[bg]) < 3:
                     bigram_examples[bg].append(
-                        {"session": sid, "text": snippet(msg, bg)}
+                        {"session": sid, "text": snippet(msg, _bigram_needle(msg, start, end))}
                     )
 
     # Bigrams from one repeated template all recur in exactly the same set of
@@ -616,7 +647,9 @@ def repeated_context(sessions: dict, claude_dir: Path, min_sessions: int = 3) ->
         "failing_rules": len(failing),
         "failing_rule_detail": failing,
         "candidate_failing_rules": len(candidates),
-        "uncovered_repeats": len(repeats) - len(candidates),
+        "uncovered_repeats": sum(
+            1 for r in repeats if not r["covered_by_rule"] and not r["templated"]
+        ),
         "rule_files_scanned": len(rules),
     }
 
@@ -793,8 +826,20 @@ _GRAPHIFY_CLI_RX = re.compile(
 #: bypasses it, and a reason is now required. Both forms appear in the corpus.
 _BYPASS_REASON_RX = re.compile(re.escape(GRAPHIFY_OK[:-1]) + r"(:\s*([a-z-]+))?\]?")
 
-_SEARCH_RX = re.compile(r"\b(grep|rg|ripgrep|ag|ack|ugrep|find|fgrep|egrep)\b")
-_RECURSIVE_RX = re.compile(r"-[a-zA-Z]*r[a-zA-Z]*\b|--recursive|\brg\b")
+_GREP_TOOLS = {"grep", "egrep", "fgrep", "ugrep"}
+#: Walk the directory tree by default, with no flag needed.
+_TREE_TOOLS = {"rg", "ripgrep", "ag", "ack"}
+_SEARCH_TOOLS = _GREP_TOOLS | _TREE_TOOLS | {"find"}
+_SHELLS = {"sh", "bash", "dash", "zsh"}
+#: Short grep options that take a value: the rest of the word, or the next word.
+_GREP_VALUE_FLAGS = set("efmABCdD")
+_GREP_RECURSIVE_LONG = {"--recursive", "--dereference-recursive", "--directories=recurse"}
+_SHELL_COMMENT_RX = re.compile(r"(?:^|\s)#.*$")
+#: A plain grep handed its files by a tree walk is a recursive grep in disguise.
+_TREE_FED_GREP_RX = re.compile(
+    r"\b(?:find|fd|fdfind|ls-files)\b[^;\n]*(?:\bxargs|\s-exec(?:dir)?|\s-x)\s[^;\n]*\b[ef]?grep\b"
+    r"|\b[ef]?grep\b[^;\n]*\$\((?:find|fd|fdfind|git\s+ls-files)\b"
+)
 #: Paths that are not code: the guard has no graph for these, so firing on
 #: them is a false positive.
 _NON_CODE_RX = re.compile(
@@ -802,12 +847,108 @@ _NON_CODE_RX = re.compile(
 )
 
 
+def _shell_words(line: str) -> list[str]:
+    """Split one line of shell into words and operators.
+
+    Transcript commands are not always valid shell; an unbalanced quote falls
+    back to splitting on whitespace and operators.
+    """
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return re.sub(r"[|&;()]", " ; ", line).split()
+
+
+def _is_operator(word: str) -> bool:
+    return bool(word) and set(word) <= set("();<>|&") and bool(set(word) & set("();|&"))
+
+
+def _simple_commands(command: str) -> list[list[str]]:
+    """The argv of each command in *command*, including substitutions and ``sh -c``."""
+    commands: list[list[str]] = []
+    nested: list[str] = []
+    text = command.replace("\\\n", " ").replace("`", " ; ")
+    for line in text.splitlines():
+        words: list[str] = []
+        for word in _shell_words(_SHELL_COMMENT_RX.sub("", line)):
+            if _is_operator(word):
+                commands.append(words)
+                words = []
+                continue
+            if "$(" in word:
+                nested.append(word.split("$(", 1)[1])
+            elif words and words[-1] == "-c" and any(_tool_name(w) in _SHELLS for w in words):
+                nested.append(word)
+            words.append(word)
+        commands.append(words)
+    for inner in nested:
+        commands.extend(_simple_commands(inner))
+    return [c for c in commands if c]
+
+
+def _tool_name(word: str) -> str:
+    return word.rsplit("/", 1)[-1]
+
+
+def _search_tool_index(words: list[str]) -> int | None:
+    for i, word in enumerate(words):
+        if _tool_name(word) in _SEARCH_TOOLS:
+            return i
+    return None
+
+
+def _grep_flags_recursive(args: list[str]) -> bool:
+    """Did this grep's own options ask for recursion?
+
+    Takes only the words after the tool, so ``xargs -r grep`` is not recursive,
+    and reads short options as clusters, so ``-er`` is the pattern ``r``.
+    """
+    skip_next = False
+    for i, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        following = args[i + 1] if i + 1 < len(args) else ""
+        if arg == "--":
+            return False
+        if arg in _GREP_RECURSIVE_LONG or (arg == "--directories" and following == "recurse"):
+            return True
+        if arg.startswith("--") or not arg.startswith("-"):
+            continue
+        for j, flag in enumerate(arg[1:], 2):
+            if flag in "rR":
+                return True
+            if flag in _GREP_VALUE_FLAGS:
+                value = arg[j:]
+                if flag == "d" and (value or following) == "recurse":
+                    return True
+                skip_next = not value
+                break
+    return False
+
+
+def _searches_a_tree(words: list[str]) -> bool:
+    i = _search_tool_index(words)
+    if i is None:
+        return False
+    tool = _tool_name(words[i])
+    if tool in _TREE_TOOLS:
+        return True
+    if tool not in _GREP_TOOLS:
+        return False
+    return _tool_name(words[0]) == "git" or _grep_flags_recursive(words[i + 1 :])
+
+
 def _classify_bypass(command: str, graphed_projects: set[str]) -> str:
-    if not _SEARCH_RX.search(command):
+    commands = _simple_commands(command)
+    if all(_search_tool_index(words) is None for words in commands):
         return "no-search-command-at-all"
     if _NON_CODE_RX.search(command):
         return "guard-false-positive-non-code"
-    if not _RECURSIVE_RX.search(command):
+    if not (any(_searches_a_tree(words) for words in commands) or _TREE_FED_GREP_RX.search(command)):
         return "was-never-blocked-anyway"
     return "genuine-circumvention"
 

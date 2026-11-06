@@ -5,6 +5,11 @@ Layout of ~/.claude/projects/:
     <project-slug>/<session-uuid>.jsonl                       main session
     <project-slug>/<session-uuid>/subagents/agent-<id>.jsonl  subagent
     <project-slug>/<session-uuid>/subagents/agent-<id>.meta.json
+    <project-slug>/<session-uuid>/subagents/workflows/wf_<id>/agent-<id>.jsonl  workflow subagent
+    <project-slug>/<session-uuid>/subagents/workflows/wf_<id>/agent-<id>.meta.json
+
+A workflow directory also holds ``journal.jsonl``, which is the workflow's own
+log and not a transcript.
 
 The meta sidecar is named ``agent-<id>.meta.json`` -- there is no bare
 ``meta.json`` anywhere in the corpus.  It carries::
@@ -30,7 +35,7 @@ class Transcript:
     project: str
     session_id: str
     is_subagent: bool
-    #: For subagents only: parent main-session uuid (the grandparent dir name).
+    #: For subagents only: parent main-session uuid (the dir above ``subagents``).
     parent_session_id: str | None = None
     #: For subagents only: parsed agent-<id>.meta.json contents.
     meta: dict = field(default_factory=dict)
@@ -38,11 +43,15 @@ class Transcript:
     @property
     def agent_type(self) -> str | None:
         """Declared agent type from the meta sidecar (``Explore``, ``worker``...)."""
-        return self.meta.get("agentType")
+        declared = self.meta.get("agentType")
+        return declared if isinstance(declared, str) else None
 
     @property
     def spawn_depth(self) -> int:
-        return int(self.meta.get("spawnDepth") or 0)
+        try:
+            return int(self.meta.get("spawnDepth") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
 
 def _read_meta(jsonl_path: Path) -> dict:
@@ -76,8 +85,12 @@ def discover(root: Path | str = DEFAULT_ROOT) -> list[Transcript]:
                 )
             )
 
-        for sub in sorted(project_dir.glob("*/subagents/*.jsonl")):
-            parent = sub.parent.parent.name
+        subagents = [
+            *project_dir.glob("*/subagents/*.jsonl"),
+            *project_dir.glob("*/subagents/workflows/*/agent-*.jsonl"),
+        ]
+        for sub in sorted(subagents):
+            parent = sub.relative_to(project_dir).parts[0]
             out.append(
                 Transcript(
                     path=sub,
