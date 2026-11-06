@@ -404,35 +404,65 @@ def _finding_repeated_context(snap: dict, prev: dict | None, diff_idx: dict) -> 
         for p in tracked.values() if p.get("examples")
     )
 
-    failing = [p for p in _g(rc, "repeated_phrases", default=[]) if p.get("status") == "FAILING RULE"]
+    # A tracked probe is the only real failing rule: its rule and trigger are
+    # known. A recurring phrase that a rule mentions is a candidate to check,
+    # which metrics.repeated_context hedges on purpose, so it never turns the
+    # finding red by itself.
+    failing = _g(rc, "failing_rule_detail", default=[])
     fail_rows = []
     for p in failing[:20]:
         fail_rows.append([
-            f'<code>{_e(p.get("phrase"))}</code>',
+            _e(p.get("label")),
+            _fmt_num(p.get("messages")),
             _fmt_num(p.get("sessions")),
-            _e(p.get("covering_file")) or "—",
+            _e(p.get("covered_by")) or "—",
         ])
-    fail_table = _table(["phrase", "sessions", "covering file"], fail_rows, "No failing rules found.")
+    fail_table = _table(
+        ["rule", "messages", "sessions", "covered by"], fail_rows, "No failing rules found."
+    )
 
     fail_examples = "".join(
-        f"<details class=\"nested\"><summary><code>{_e(p.get('phrase'))}</code> — evidence "
-        f"({_fmt_num(p.get('sessions'))} sessions, covered by {_e(p.get('covering_file'))})</summary>"
+        f"<details class=\"nested\"><summary>{_e(p.get('label'))} — evidence "
+        f"({_fmt_num(p.get('sessions'))} sessions, covered by {_e(p.get('covered_by'))})</summary>"
         f"{_examples_block(p.get('examples', []))}</details>"
         for p in failing[:10]
     )
 
     if failing:
         fix = (
-            f"<h4>Fix</h4><p>{len(failing)} phrases recur across multiple sessions despite an "
-            f"existing rule covering them. The rule exists but is not preventing the repetition — "
-            f"expand the excerpt below out to see the actual re-asks, then tighten the covering "
-            f"file's trigger wording or add the literal phrasing as an explicit example.</p>"
+            f"<h4>Fix</h4><p>{len(failing)} tracked rules exist and were still asked for by hand. "
+            f"The rule is not preventing the repetition — expand the excerpts below to see the "
+            f"actual re-asks, then tighten the covering file's trigger wording or add the literal "
+            f"phrasing as an explicit example.</p>"
             f"{fail_examples}"
         )
         verdict = "bad"
     else:
         fix = '<p class="muted">No covered rule is failing to prevent repetition right now.</p>'
         verdict = "good"
+
+    candidates = [
+        p for p in _g(rc, "repeated_phrases", default=[])
+        if p.get("covered_by_rule") and not p.get("templated")
+    ]
+    candidate_rows = [
+        [f'<code>{_e(p.get("phrase"))}</code>', _fmt_num(p.get("sessions")),
+         _e(p.get("covering_file")) or "—"]
+        for p in candidates[:20]
+    ]
+    candidate_examples = "".join(
+        f"<details class=\"nested\"><summary><code>{_e(p.get('phrase'))}</code> — evidence "
+        f"({_fmt_num(p.get('sessions'))} sessions, mentioned in {_e(p.get('covering_file'))})</summary>"
+        f"{_examples_block(p.get('examples', []))}</details>"
+        for p in candidates[:10]
+    )
+    candidate_section = ""
+    if candidates:
+        candidate_section = (
+            "<h4>Candidates: a rule mentions the phrase, check whether it failed</h4>"
+            + _table(["phrase", "sessions", "covering file"], candidate_rows)
+            + candidate_examples
+        )
 
     body = f"""
       <h4>Tracked probes (fixes applied 2026-07-17 must move these)</h4>
@@ -441,6 +471,7 @@ def _finding_repeated_context(snap: dict, prev: dict | None, diff_idx: dict) -> 
       <h4>Failing rules: covered by an existing rule, still repeated</h4>
       {fail_table}
       {fix}
+      {candidate_section}
       <p class="muted">{_fmt_num(rc.get("uncovered_repeats"))} additional repeated phrases have no
         covering rule at all (not shown — those are backlog, not broken rules) across
         {_fmt_num(rc.get("rule_files_scanned"))} rule files scanned.</p>
